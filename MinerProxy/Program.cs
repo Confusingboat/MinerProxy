@@ -5,89 +5,265 @@ using System.Net.Sockets;
 using System.Threading;
 using System.Collections.Concurrent;
 using System.Threading.Tasks;
-
-//try to move the logging blocking collection into this class
-//then just initialize it once and have every thread add to it, instead of making a new thread
-//for each logger for each session
+using MinerProxy.Web;
+using MinerProxy.Logging;
+using WebSocketSharp.Server;
+using System.Collections.Generic;
+using MinerProxy.Network;
+using MinerProxy.Miners;
+using static MinerProxy.Donations;
 
 namespace MinerProxy
 {
     internal sealed class Program
     {
-        private static int localPort;
-        private static string remoteHost;
-        private static int remotePort;
-        private static bool log;
-        private static bool debug;
-        private static bool replaceRigName;
-        private static string walletAddress;
-        private static string allowedAddress;
+        public static Settings settings;
+        
         public static BlockingCollection<LogMessage> _logMessages = new BlockingCollection<LogMessage>();
+        public static SlidingBuffer<ConsoleList> _webConsoleQueue = new SlidingBuffer<ConsoleList>(60);
+        public static BlockingCollection<ConsoleList> _consoleQueue = new BlockingCollection<ConsoleList>();
 
+        public static List<MinerStatsFull> _minerStats = new List<MinerStatsFull>();
+        public static int currentClients;
+
+        public static HttpServer webSock;
         private static Socket listener;
         private static ManualResetEvent allDone;
 
         static void Main(string[] args)
         {
-            if (args.Length < 6)
-            {
-                Console.WriteLine("Usage : MinerProxy.exe <local port> <remote host> <remote port> <Allowed IP> <Your Wallet Address> <Identify DevFee> <Log to file> <debug>");
-                Console.WriteLine("MinerProxy.exe 9000 us1.ethermine.org 4444 127.0.0.1 0x3Ff3CF71689C7f2f8F5c1b7Fc41e030009ff7332 True False False");
-                return;
-            }
+            Logger.MinerProxyHeader();
 
-            try
-            {
-                localPort = Convert.ToInt32(args[0]);
-                remoteHost = args[1];
-                remotePort = Convert.ToInt32(args[2]);
-                allowedAddress = args[3];
-                walletAddress = args[4];
-                replaceRigName = Convert.ToBoolean(args[5]);
-                log = Convert.ToBoolean(args[6]);
-                debug = Convert.ToBoolean(args[7]);
-            }
-            catch (Exception ex)
-            {
-                Logger.LogToConsole("Check your command arguments: " + ex.Message);
-                Console.ReadKey();
-                return;
-            }
+            // Load and process settings in the Settings class
+            Settings.ProcessArgs(args, out settings);
 
             AppDomain.CurrentDomain.UnhandledException += (s, e) => File.WriteAllText("Exceptions.txt", e.ExceptionObject.ToString());
 
-            if (log) { //if logging enabled, let's start the logging queue
-                var task = new Task(() => ProcessLogQueue(), TaskCreationOptions.LongRunning);
-                task.Start();
+            Logger.logFileName = DateTime.Now.ToString("s").Replace(":", ".") + "_log";
+            CancellationTokenSource logTokenSource = new CancellationTokenSource();
+            CancellationToken logToken = logTokenSource.Token;
+            var logQueue = new Task(() => ProcessLogQueue(logToken), TaskCreationOptions.LongRunning);
+            if (settings.log) //if logging enabled, let's start the logging queue
+                logQueue.Start();
+
+            var consoleQueue = new Task(() => ProcessConsoleQueue(), TaskCreationOptions.LongRunning);
+            consoleQueue.Start();
+
+            if (settings.debug)
+                Logger.LogToConsole("Debug enabled", "MinerProxy");
+
+            if (settings.identifyDevFee)
+                Logger.LogToConsole("Identifying DevFee connections as 'DevFee'", "MinerProxy");
+
+            Logger.LogToConsole("Coin protocol: " + settings.minedCoin, "MinerProxy");
+
+            if (settings.donateDevFee)
+            {
+                Logger.LogToConsole(string.Format("You are donating {0}% of DevFees to LostSoulfly and Samut3. Thanks!", Program.settings.percentToDonate), "MinerProxy");
+                SetUpDonateLists();
+            } else
+            {
+                Logger.LogToConsole("You are not donating a DevFee percentage to MinerProxy maintainers.", "MinerProxy");
             }
 
-            if (debug)
-                Logger.LogToConsole("Debug enabled");
+            if (Program.settings.replaceWallet)
+            {
+                Logger.LogToConsole("Replacing Wallets with: " + settings.walletAddress, "MinerProxy", ConsoleColor.Yellow);
+                if (!string.IsNullOrWhiteSpace(settings.devFeeWalletAddress))
+                    Logger.LogToConsole("Replacing DevFee wallets with " + settings.devFeeWalletAddress, "MinerProxy", ConsoleColor.Yellow);
+            }
+            else
+            {
+                Logger.LogToConsole("Not replacing Wallets", "MinerProxy");
+            }
+            
+            //initialize webSock
+            if (Program.settings.useWebSockServer)
+            {
+                try
+                {
+                    webSock = new HttpServer(settings.webSocketPort);
+                    webSock.RootPath = Directory.GetCurrentDirectory() + @"\web\";
+                    Directory.CreateDirectory(webSock.RootPath);
+                    if (settings.debug) Logger.LogToConsole(string.Format("Web root: {0}", webSock.RootPath), "MinerProxy");
 
-            if (replaceRigName)
-                Logger.LogToConsole("Showing DevFee mining as 'DevFee' rigName");
-
-            Logger.LogToConsole("Replacing Wallets with: " + walletAddress);
+                    webSock.OnGet += new EventHandler<HttpRequestEventArgs>(Web.WebIndex.OnGet);
+                    webSock.AddWebSocketService<WebIndex>("/");
+                    webSock.AddWebSocketService<WebConsole>("/console");
+                    webSock.Start();
+                    Logger.LogToConsole(string.Format("WebSockServer listening on port {0}", settings.webSocketPort), "MinerProxy");
+                } catch (Exception ex)
+                {
+                    Logger.LogToConsole(string.Format("Unable to start WebSocketServer on port {0}. Error: {1}", settings.webSocketPort, ex.Message));
+                }
+            }
 
             try
             {
                 listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-                listener.Bind(new IPEndPoint(IPAddress.Any, localPort));
+                listener.Bind(new IPEndPoint(IPAddress.Any, settings.proxyListenPort));
                 listener.Listen(100);
             } catch (Exception ex)
             {
-                Console.WriteLine("Error: {0}", ex.Message);
+                Logger.LogToConsole(string.Format("Error: {0}", ex.Message), color: ConsoleColor.Red);
                 return;
             }
+
             allDone = new ManualResetEvent(false);
 
-            Console.Title = string.Concat("MinerProxy : ", remoteHost, ':', remotePort);
-            Logger.LogToConsole(string.Format("Listening for miners on port {0}, on IP {1}", localPort, allowedAddress));
+            UpdateConsoleTitle();
+            Logger.LogToConsole(string.Format("Listening for miners on port {0}, on IP {1}", settings.proxyListenPort, listener.LocalEndPoint), "MinerProxy");
+            Logger.LogToConsole("Accepting connections from: " + string.Join(", ", settings.allowedAddresses), "MinerProxy");
+
+            Logger.LogToConsole("Press 'H' for available commands", "MinerProxy");
+
+            var listenerTask = new Task(() => listenerStart(), TaskCreationOptions.LongRunning);
+            listenerTask.Start();
             
+            string key;
+
+            while (true)
+            {
+                if (Console.KeyAvailable)
+                {
+                    key = Console.ReadKey(true).Key.ToString();
+
+                    switch (key)
+                    {
+
+                        case "S":
+                            settings.showRigStats = !settings.showRigStats;
+                            Logger.LogToConsole((settings.showRigStats) ? "RigStats enabled" : "RigStats disabled", "MinerProxy");
+                            break;
+
+                        case "U":
+                            //update settings file with new options
+                            Settings.writeSettings(settings.settingsFile, settings);
+                            Logger.LogToConsole(string.Format("Updated {0} file to newest version", settings.settingsFile), "MinerProxy");
+                            break;
+
+                        case "C":
+                            settings.colorizeConsole = (!settings.colorizeConsole);
+                            Logger.LogToConsole((settings.colorizeConsole) ? "Colors enabled" : "Colors disabled", "MinerProxy");
+                            break;
+
+                        case "E":
+                            settings.showEndpointInConsole = (!settings.showEndpointInConsole);
+                            Logger.LogToConsole((settings.showEndpointInConsole) ? "Endpoint prefix enabled" : "Endpoint prefix disabled", "MinerProxy");
+                            break;
+
+                        case "P":
+                            Console.WriteLine("Pool count: " + settings.poolList.Count);
+                            Console.WriteLine("Curent: " + settings.GetCurrentPool().poolAddress + ":" + settings.GetCurrentPool().poolPort);
+                            Console.WriteLine("New Pool:" + settings.GetNextPool().poolAddress + ":" + settings.GetCurrentPool().poolPort);
+
+                            break;
+
+                        case "L":
+                            settings.log = !settings.log;
+                            Logger.LogToConsole((settings.log) ? "Logging enabled" : "Logging disabled", "MinerProxy");
+
+                            if (settings.log)
+                            {
+                                logTokenSource = new CancellationTokenSource();
+                                logToken = logTokenSource.Token;
+                                logQueue = new Task(() => ProcessLogQueue(logToken), TaskCreationOptions.LongRunning);
+                                logQueue.Start();
+                            }
+                            else
+                            {
+                                logTokenSource.Cancel();
+                            }
+                            break;
+
+                        case "D":
+                            settings.debug = !settings.debug;
+                            Logger.LogToConsole((settings.debug) ? "Debug enabled" : "Debug disabled", "MinerProxy");
+                            break;
+
+                        case "Q":
+                            Logger.LogToConsole("Shutting down MinerProxy..", "MinerProxy");
+                            System.Environment.Exit(0);
+                            return;
+
+                        case "M":
+                            for (int i = 0; i < _minerStats.Count; i++)
+                            {
+                                Console.WriteLine("Miner displayName: {0}", _minerStats[i].displayName);
+                                Console.WriteLine("Miner workerName: {0}", _minerStats[i].workerName);
+                                Console.WriteLine("Miner rigName: {0}", _minerStats[i].rigName);
+                                Console.WriteLine("Miner numberOfConnects: {0}", _minerStats[i].numberOfConnects);
+                                Console.WriteLine("Miner connectionAlive: {0}", _minerStats[i].connectionAlive);
+                                Console.WriteLine("Miner endPoint: {0}", _minerStats[i].endPoint);
+                                Console.WriteLine("Miner connectionName: {0}", _minerStats[i].connectionName);
+                                Console.WriteLine("Miner firstConnectTime: {0}", _minerStats[i].firstConnectTime.ToString());
+                                Console.WriteLine("Miner connectionStartTime: {0}", _minerStats[i].connectionStartTime.ToString());
+                                Console.WriteLine("Miner totalTimeConnected: {0}", _minerStats[i].totalTimeConnected.ToString());
+                                Console.WriteLine("Miner submittedShares: {0}", _minerStats[i].submittedShares);
+                                Console.WriteLine("Miner acceptedShares: {0}", _minerStats[i].acceptedShares);
+                                Console.WriteLine("Miner rejectedShares: {0}", _minerStats[i].rejectedShares);
+                                Console.WriteLine("Miner hashrate: {0}", _minerStats[i].hashrate);
+                                Console.WriteLine("Miner GetAverageHashrate: {0}", _minerStats[i].GetAverageHashrate());
+                                if (!String.IsNullOrEmpty(_minerStats[i].displayName)) {
+                                    Console.WriteLine("Miner Wallets:");
+                                    Console.WriteLine(string.Join("\n", MinerManager.GetMinerWallets(_minerStats[i].displayName).ToArray()));
+                                }
+                            }
+                            break;
+
+                        case "X":
+                                File.WriteAllText("MinerStats.json", Newtonsoft.Json.JsonConvert.SerializeObject(_minerStats, Newtonsoft.Json.Formatting.Indented));
+                            Logger.LogToConsole("Exported MinerStats to MinerStats.json", "MinerProxy");
+                            break;
+
+                        case "O":
+                            DonateList d = new DonateList();
+                            double success = 0;
+                            for (int i = 0; i < 1000; i++)  //be careful doing this with debug and more than 10k. Could take a while.
+                            {
+                                if (CheckForDonation(out d, "ETH"))
+                                {
+                                    if (settings.debug) Logger.LogToConsole(d.donatePoolAddress + " " + d.donatePoolPort + " " + d.donateWallet);
+                                    success++;
+                                }
+                            }
+                            Logger.LogToConsole("Success percentage: " + ((success / 1000) * 100) + "% out of 1,000", "MinerProxy");
+                            Logger.LogToConsole("Win: " + success + " - Lose: " + (1000 - success) + ". Donate percent: " + settings.percentToDonate, "MinerProxy");
+                            break;
+
+                        case "H":
+                            lock (Logger.ConsoleBlockLock)
+                            {
+                                Logger.LogToConsole("MinerProxy Available Commands", "HELP", ConsoleColor.Yellow);
+                                Logger.LogToConsole("S key: Enable/Disable showing Rig Stats", "HELP", ConsoleColor.Yellow);
+                                Logger.LogToConsole("C key: Enable/Disable console colors", "HELP", ConsoleColor.Yellow);
+                                Logger.LogToConsole("E key: Enable/Disable Endpoint prefix on log messages", "HELP", ConsoleColor.Yellow);
+                                Logger.LogToConsole("L key: Enable/Disable logging to file", "HELP", ConsoleColor.Yellow);
+                                Logger.LogToConsole("D key: Enable/Disable debug messages", "HELP", ConsoleColor.Yellow);
+                                Logger.LogToConsole("M key: Print all miner stats to console", "HELP", ConsoleColor.Yellow);
+                                Logger.LogToConsole("X key: Export all miner stats to MinerStats.json", "HELP", ConsoleColor.Yellow);
+                                Logger.LogToConsole("O key: Run a test of DevFee donation percentages. Turn debug off for faster tests.");
+                                Logger.LogToConsole("U key: Update the loaded JSON file with current settings", "HELP", ConsoleColor.Yellow);
+                                Logger.LogToConsole("Q key: Quit MinerProxy", "HELP", ConsoleColor.Yellow);
+                            }
+                                break;
+                    }
+                }
+                Thread.Sleep(1);
+            }
+        }
+
+        private static void WebSock_OnGet(object sender, HttpRequestEventArgs e)
+        {
+            throw new NotImplementedException();
+        }
+
+        private static void listenerStart()
+        {
             while (true)
             {
                 allDone.Reset();
-                listener.BeginAccept(new AsyncCallback(AcceptCallback),null);
+                listener.BeginAccept(new AsyncCallback(AcceptCallback), null);
                 allDone.WaitOne();
             }
         }
@@ -95,38 +271,77 @@ namespace MinerProxy
         private static void AcceptCallback(IAsyncResult iar)
         {
             allDone.Set();
-            
+
             try
             {
                 var socket = listener.EndAccept(iar);
+                string remoteAddress = ((IPEndPoint)socket.RemoteEndPoint).Address.ToString();
 
-                IPAddress remoteAddress = ((IPEndPoint)socket.RemoteEndPoint).Address;
-
-                if (allowedAddress != "0.0.0.0")
+                if (!settings.allowedAddresses.Contains("0.0.0.0"))
                 {
-                    if (!remoteAddress.Equals(IPAddress.Parse(allowedAddress)))
+                    if (!settings.allowedAddresses.Contains(remoteAddress))
                     {
-                        Logger.LogToConsole("Remote host " + remoteAddress + " not allowed; ignoring.");
+                        Logger.LogToConsole("Remote host " + remoteAddress + " not allowed; ignoring", "MinerProxy", ConsoleColor.Red);
 
-                        return; //if the address supplied isn't allowed, just retrun and keep listening.
+                        return; //if the address supplied isn't allowed, just return and keep listening.
                     }
                 }
-                new Redirector(socket, remoteHost, remotePort, walletAddress, replaceRigName, debug, log);
+
+                new Redirector(socket, settings.GetCurrentPool().poolAddress, settings.GetCurrentPool().poolPort);
+            
             }
             catch (SocketException se)
             {
-                Logger.LogToConsole(string.Format("Accept failed with {0}", se.ErrorCode)); 
+                Logger.LogToConsole(string.Format("Accept failed with {0}", se.ErrorCode), color: ConsoleColor.Red);
             }
         }
 
-        private static void ProcessLogQueue()
+        private static void UpdateConsoleTitle()
         {
-            Logger.LogToConsole("Logging queue started..");
+            Console.Title = string.Format("MinerProxy: {0}:{1} Clients: {2}", settings.GetCurrentPool().poolAddress, settings.GetCurrentPool().poolPort, currentClients);
+        }
+
+        public static void DecrementClientCount()
+        {
+            currentClients--;
+            UpdateConsoleTitle();
+        }
+
+        public static void IncrementClientCount()
+        {
+            currentClients++;
+            UpdateConsoleTitle();
+        }
+
+        
+        private static void ProcessConsoleQueue()
+        {
+            if (settings.debug) Logger.LogToConsole("Console queue started", "MinerProxy");
+            settings.consoleQueueStarted = true;
+            foreach (var msg in _consoleQueue.GetConsumingEnumerable())
+            {
+                lock (Logger.ConsoleBlockLock)
+                {
+                    Logger.LogToConsole(msg.message, msg.endPoint, msg.color, true);
+                }
+            }
+        }
+
+        private static void ProcessLogQueue(CancellationToken token)
+        {
+            if (settings.debug) Logger.LogToConsole("Logging queue started", "MinerProxy");
 
             foreach (var msg in _logMessages.GetConsumingEnumerable())
             {
-
-                File.AppendAllText(msg.Filepath, msg.Text + "\r\n");
+                if (!token.IsCancellationRequested)
+                {
+                    File.AppendAllText(msg.Filepath, msg.Text + "\r\n");
+                }
+                else
+                {
+                    if (settings.debug) Logger.LogToConsole("Logging queue stopped", "MinerProxy");
+                    return;
+                }
             }
 
         }
